@@ -5,7 +5,7 @@
 
 #' Risk of bias blobbogram plot
 #'
-#' @param rma an rma object from the metafor package
+#' @param ma an object from the brms or metafor packages
 #' @param rob a risk of bias table, either ROB2, ROB2-Cluster, QUADAS-2, or Robins (see example data)
 #' @param rob_tool The risk of bias tool used. Defaults to ROB2. Supports "ROB2", "ROB2-Cluster", "QUADAS-2", and "Robins".
 #' @param rob_colour The risk of bias colour scheme. As in other robvis functions. Supports "cochrane", "colourblind" or a custom vector of colours.
@@ -18,7 +18,7 @@
 #' @return an image
 #'
 #' @export
-rob_blobbogram <- function(rma,
+rob_blobbogram <- function(ma,
                            rob,
                            rob_tool = "ROB2",
                            rob_colour = "cochrane",
@@ -27,16 +27,21 @@ rob_blobbogram <- function(rma,
                            subset_col_order = NULL,
                            overall_estimate = TRUE,
                            add_tests = TRUE,
+                           cache_label = 'foo',
                            ...){
 
-  data <- metafor_object_to_table(rma,
-                                  rob,
-                                  subset_col = subset_col,
-                                  rob_tool = rob_tool,
-                                  rob_colour = rob_colour,
-                                  subset_col_order = subset_col_order,
-                                  overall_estimate = overall_estimate,
-                                  add_tests = add_tests)
+  if (class(ma) == 'brmsfit') {  # brms meta-analysis
+    data <- brms_object_to_table(ma, rob, cache_label = cache_label, subset_col = 'group')
+  } else {                       # metafor meta-analysis
+    data <- metafor_object_to_table(ma,
+                                    rob,
+                                    subset_col = subset_col,
+                                    rob_tool = rob_tool,
+                                    rob_colour = rob_colour,
+                                    subset_col_order = subset_col_order,
+                                    overall_estimate = overall_estimate,
+                                    add_tests = add_tests)
+  }
 
   rob_plot <- select_rob_columns(data, rob_tool) %>%
     appendable_rob_ggplot(rob_tool = rob_tool,
@@ -54,6 +59,109 @@ rob_blobbogram <- function(rma,
 
 # Helpers for rob_blobbogram ====
 
+brms_function <- function(model, data = dat, cache_file = 'foo') {
+  # store study names because spread draws doesn't like commas (I think)
+  data <- data %>%
+    mutate(study_number = as.numeric(rownames(data)))
+  study_names <- data %>% select(study_number, Study)
+
+  model <- brm(
+    d | se(se) ~ 1 + (1 | study_number),
+    data = data,
+    chains=8, iter=10e4,
+    prior = c(prior_string("normal(0,1)", class = "Intercept"),
+              prior_string("cauchy(0, .5)", class = "sd")),
+    file = paste(cache_file, 'brms', sep = '-')
+  )
+
+  # For an explanation of tidybayes::spread_draws(), refer to http://mjskay.github.io/tidybayes/articles/tidy-brms.html
+  # Study-specific effects are deviations + average
+  draws <- spread_draws(model, r_study_number[study_number, term], b_Intercept) %>%
+    rename(b = b_Intercept) %>%
+    mutate(b = r_study_number + b) %>%
+    left_join(study_names, by = 'study_number')
+
+  # Average effect
+  draws_overall <- spread_draws(model, b_Intercept) %>%
+    rename(b = b_Intercept) %>%
+    mutate(Study = "Overall")
+
+  # Combine average and study-specific effects' data frames
+  combined_draws <- bind_rows(draws, draws_overall) %>%
+    ungroup() %>%
+    mutate(Study = fct_relevel(Study, "Overall", after = Inf)) # put overall effect after individual studies
+
+  # summarise in metafor format
+  metafor <- group_by(combined_draws, Study) %>%
+    mean_qi(b) %>%
+    rename(est = b, ci_low = .lower, ci_high = .upper)
+
+  return(metafor)
+}
+
+brms_object_to_table <- function(model, rob, overall_estimate = FALSE, subset_col = "Overall",
+                                 rob_colour = "cochrane", rob_tool = "ROB2", subset_col_order = NULL,
+                                 cache_label = 'foo') {
+
+  table <- merge(data.frame(model$data %>% select(Study, d, se), stringsAsFactors = FALSE),
+                 rob, by = "Study")
+
+  # Reorder data
+  table <- dplyr::select(table, Study, dplyr::everything())
+
+  # Clean level names so that they look nice in the table
+  table[[subset_col]] <- stringr::str_to_sentence(table[[subset_col]])
+  levels <- unique(table[[subset_col]])
+
+  if(!(is.null(subset_col_order))){
+    levels <- intersect(subset_col_order, levels)
+  }else if(rob_tool %in% c("ROB2", "QUADAS-2", "ROB2-Cluster") & subset_col == "Overall"){
+    levels <- intersect(c("High", "Some concerns", "Low", "No information"), levels)
+  }else if(rob_tool == "Robins" & subset_col == "Overall"){
+    levels <- intersect(c("Critical", "Serious", "Moderate", "Low", "No information"), levels)
+  }
+
+  # Work out if only one level is present. Passed to create_subtotal_row(), so
+  # that if only one group, no subtotal is created.
+  single_group <- ifelse(length(levels)==1, TRUE, FALSE)
+
+  # Subset data by levels, run user-defined metafor function on them, and
+  # recombine along with Overall rma output
+  subset <- lapply(levels, function(level){dplyr::filter(table, !!as.symbol(subset_col) == level)})
+  names(subset) <- levels
+
+  # model each data subset
+  subset_res <- lapply(levels, function(level){brms_function(model, data = subset[[level]],
+                                                             cache_file = paste(cache_label, level, sep = '-'))})
+  names(subset_res) <- levels
+
+  # This binds the table together
+  subset_tables <-
+    lapply(levels, function(level){
+      rbind(
+        create_title_row(level),
+        dplyr::select(subset_res[[level]], Study, .data$est, .data$ci_low, .data$ci_high)
+      )
+    })
+
+  subset_table <- do.call("rbind", lapply(subset_tables, function(x) x))
+
+  ordered_table <- rbind(subset_table,
+                         if (overall_estimate) {
+                           create_subtotal_row(rma, "Overall", add_blank = FALSE)
+                         })
+
+  # Indent the studies for formatting purposes
+  ordered_table$Study <- as.character(ordered_table$Study)
+  ordered_table$Study <- ifelse(!(ordered_table$Study %in% levels) & ordered_table$Study != "Overall",
+                                paste0("  ", ordered_table$Study),
+                                ordered_table$Study)
+
+  rob$Study <- paste0("  ", rob$Study)
+
+  return(dplyr::left_join(ordered_table, rob, by = "Study"))
+}
+
 metafor_function <- function(res, data = dat){
   eval(rlang::call_modify(res$call, data = quote(data)))
 }
@@ -66,9 +174,13 @@ create_subtotal_row <- function(rma,
 
   if (single_group == FALSE) {
     row <- data.frame(Study = name,
-                      est = exp(rma$b),
-                      ci_low = exp(rma$ci.lb),
-                      ci_high = exp(rma$ci.ub))
+                      # est = exp(rma$b),
+                      # ci_low = exp(rma$ci.lb),
+                      # ci_high = exp(rma$ci.ub)
+                      est = rma$b,
+                      ci_low = rma$ci.lb,
+                      ci_high = rma$ci.ub
+                      )
 
 
     if (add_tests) {
@@ -201,9 +313,12 @@ metafor_object_to_table <- function(rma,
   table <- merge(data.frame(Study = rma$slab,
                             yi = rma$yi,
                             vi = rma$vi,
-                            est = exp(rma$yi),
-                            ci_low = exp(rma$yi - 1.96 * sqrt(rma$vi)),
-                            ci_high = exp(rma$yi + 1.96 * sqrt(rma$vi)),
+                            # est = exp(rma$yi),
+                            # ci_low = exp(rma$yi - 1.96 * sqrt(rma$vi)),
+                            # ci_high = exp(rma$yi + 1.96 * sqrt(rma$vi)),
+                            est = rma$yi,
+                            ci_low =  rma$yi - 1.96 * sqrt(rma$vi),
+                            ci_high = rma$yi + 1.96 * sqrt(rma$vi),
                             stringsAsFactors = FALSE),
                  rob,
                  by = "Study")
