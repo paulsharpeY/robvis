@@ -59,7 +59,7 @@ rob_blobbogram <- function(ma,
 
 # Helpers for rob_blobbogram ====
 
-brms_function <- function(model, data = dat, cache_file = 'foo') {
+brms_function <- function(model, data = dat, average_effect_label = 'Pooled effect', cache_file = 'foo') {
   # store study names because spread draws doesn't like commas (I think)
   data <- data %>%
     mutate(study_number = as.numeric(rownames(data)))
@@ -84,16 +84,16 @@ brms_function <- function(model, data = dat, cache_file = 'foo') {
   # Average effect
   draws_overall <- spread_draws(model, b_Intercept) %>%
     rename(b = b_Intercept) %>%
-    mutate(Study = "Overall")
+    mutate(Study = average_effect_label)
 
   # Combine average and study-specific effects' data frames
   combined_draws <- bind_rows(draws, draws_overall) %>%
     ungroup() %>%
-    mutate(Study = fct_relevel(Study, "Overall", after = Inf)) # put overall effect after individual studies
+    mutate(Study = fct_relevel(Study, average_effect_label, after = Inf)) # put overall effect after individual studies
 
   # summarise in metafor format
   metafor <- group_by(combined_draws, Study) %>%
-    mean_qi(b) %>%
+    mean_hdci(b) %>% # FIXME: parameterise interval
     rename(est = b, ci_low = .lower, ci_high = .upper)
 
   return(metafor)
