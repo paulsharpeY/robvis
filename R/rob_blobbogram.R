@@ -28,10 +28,14 @@ rob_blobbogram <- function(ma,
                            overall_estimate = TRUE,
                            add_tests = TRUE,
                            cache_label = 'foo',
+                           iter = '1e4',
+                           sd_prior = 'cauchy(0, .3)',
+                           adapt_delta = 0.8,
                            ...){
 
   if (class(ma) == 'brmsfit') {  # brms meta-analysis
-    data <- brms_object_to_table(ma, rob, cache_label = cache_label, subset_col = 'group')
+    data <- brms_object_to_table(ma, rob, cache_label = cache_label, subset_col = 'group',
+                                 iter = iter, sd_prior = sd_prior, adapt_delta = adapt_delta)
   } else {                       # metafor meta-analysis
     data <- metafor_object_to_table(ma,
                                     rob,
@@ -59,8 +63,12 @@ rob_blobbogram <- function(ma,
 
 # Helpers for rob_blobbogram ====
 
-brms_function <- function(model, data = dat, average_effect_label = 'Pooled effect', cache_file = 'foo') {
-  # store study names because spread draws doesn't like commas (I think)
+brms_function <- function(model, data = dat, average_effect_label = 'Pooled effect',
+                          iter = '50e4', sd_prior = "cauchy(0, .3)", adapt_delta = 0.8, cache_file = 'foo') {
+  ## https://github.com/mvuorre/brmstools
+  ## https://vuorre.netlify.com/post/2016/09/29/meta-analysis-is-a-special-case-of-bayesian-multilevel-modeling/
+
+  # store study names to avoid clashes with commas in spread_draws() column specifications
   data <- data %>%
     mutate(study_number = as.numeric(rownames(data)))
   study_names <- data %>% select(study_number, Study)
@@ -68,9 +76,10 @@ brms_function <- function(model, data = dat, average_effect_label = 'Pooled effe
   model <- brm(
     d | se(se) ~ 1 + (1 | study_number),
     data = data,
-    chains=8, iter=10e4,
+    chains=8, iter=iter,
     prior = c(prior_string("normal(0,1)", class = "Intercept"),
-              prior_string("cauchy(0, .5)", class = "sd")),
+              prior_string(sd_prior, class = "sd")),
+    control = list(adapt_delta = adapt_delta),
     file = paste(cache_file, 'brms', sep = '-')
   )
 
@@ -101,6 +110,7 @@ brms_function <- function(model, data = dat, average_effect_label = 'Pooled effe
 
 brms_object_to_table <- function(model, rob, overall_estimate = FALSE, subset_col = "Overall",
                                  rob_colour = "cochrane", rob_tool = "ROB2", subset_col_order = NULL,
+                                 iter = '1e4', sd_prior = "cauchy(0, .3)", adapt_delta = 0.8,
                                  cache_label = 'foo') {
 
   table <- merge(data.frame(model$data %>% select(Study, d, se), stringsAsFactors = FALSE),
@@ -132,6 +142,7 @@ brms_object_to_table <- function(model, rob, overall_estimate = FALSE, subset_co
 
   # model each data subset
   subset_res <- lapply(levels, function(level){brms_function(model, data = subset[[level]],
+                                                             iter = iter, sd_prior = sd_prior, adapt_delta = adapt_delta,
                                                              cache_file = paste(cache_label, level, sep = '-'))})
   names(subset_res) <- levels
 
